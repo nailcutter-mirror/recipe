@@ -55,6 +55,11 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    # Regularization tune (v0.3.x): decoupled weight decay on the Muon 2D hidden
+    # matrices (Muon otherwise leaves them unregularized) + an output logit-scale
+    # (z-loss) term. Both default OFF so the canonical baseline is unchanged.
+    muon_weight_decay: float = 0.0
+    z_loss_coef: float = 0.0
 
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
@@ -141,8 +146,9 @@ class Muon(torch.optim.Optimizer):
     """Momentum orthogonalized by Newton-Schulz, for 2D hidden weight matrices.
     See Keller Jordan's modded-nanogpt. Embeddings/heads/norms use AdamW instead."""
 
-    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                                      ns_steps=ns_steps, weight_decay=weight_decay))
 
     @torch.no_grad()
     def step(self):
@@ -160,6 +166,11 @@ class Muon(torch.optim.Optimizer):
                 upd = _zeropower_via_newtonschulz5(upd, steps=group["ns_steps"])
                 # Scale so the RMS update magnitude is ~LR-invariant to matrix shape.
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                # Decoupled (AdamW-style) weight decay, scaled with the effective
+                # per-matrix step so regularization tracks the update magnitude.
+                wd = group.get("weight_decay", 0.0)
+                if wd:
+                    p.mul_(1.0 - lr * scale * wd)
                 p.add_(upd, alpha=-lr * scale)
 
 
@@ -178,7 +189,8 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 muon_params.append(p)
             else:
                 norm_params.append(p)
-        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum,
+                    ns_steps=cfg.muon_ns_steps, weight_decay=cfg.muon_weight_decay)
         adamw = torch.optim.AdamW(
             [
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
@@ -287,7 +299,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(inp, targets=tgt)
+                logits, loss = model(inp, targets=tgt)
+                if cfg.z_loss_coef:
+                    loss = loss + cfg.z_loss_coef * (torch.logsumexp(logits.float(), dim=-1) ** 2).mean()
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
