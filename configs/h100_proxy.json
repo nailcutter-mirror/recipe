@@ -1,5 +1,5 @@
 {
- "_comment": "crown10k: fully-canonical (no data/ change) WSD+MuonWD, 10000st/2.62B tok | resubmit crown10k 124809",
+ "_comment": "crown8k_mwd FULL 8000st: clean_v4+MuonWD0.05+1sqrt bf16-NS default-compile",
  "vocab_size": 50257,
  "dim": 1024,
  "n_layers": 16,
@@ -10,8 +10,8 @@
  "seq_len": 512,
  "batch_size": 512,
  "micro_batch_size": 128,
- "total_steps": 10000,
- "warmup_steps": 700,
+ "total_steps": 8000,
+ "warmup_steps": 600,
  "max_lr": 0.0008,
  "min_lr": 1e-05,
  "weight_decay": 0.1,
@@ -32,5 +32,6 @@
  "compile": true,
  "init_seed": 6565,
  "data_seed": 6565,
- "data_curriculum": "random"
+ "data_curriculum": "random",
+ "_resubmit": "retry-scoring-1244"
 }

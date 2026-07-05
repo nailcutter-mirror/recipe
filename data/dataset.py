@@ -56,6 +56,17 @@ class TokenShardDataset:
         self.seed = seed
         if self._total < seq_len + 1:
             raise ValueError(f"not enough tokens ({self._total}) for seq_len {seq_len}")
+        # No-replacement permuted-sweep bookkeeping. We tile the token stream into
+        # `n_blocks` non-overlapping contiguous blocks of (seq_len+1) tokens each
+        # and sweep them in a deterministic seed-keyed permutation per epoch. This
+        # yields full-coverage, no-repeat-within-epoch sampling (a strictly better
+        # gradient signal than with-replacement draws — no wasted duplicate windows
+        # and no unseen holes) while remaining a pure deterministic function of
+        # (seed, step): the validator re-derives the exact same order on audit.
+        # Per-epoch permutations are MEMOIZED — never rebuilt per get_batch call —
+        # so throughput is unaffected.
+        self._n_blocks = max(1, self._total // (self.seq_len + 1))
+        self._perm_cache: dict[int, np.ndarray] = {}
 
     @property
     def total_tokens(self) -> int:
@@ -103,34 +114,43 @@ class TokenShardDataset:
         ids = torch.from_numpy(chunk.astype(np.int64))
         return ids[:-1], ids[1:]
 
-    def _perm_window_start(self, k: int) -> int:
-        """Start offset of the k-th sample under epoch-wise permutation.
-
-        Non-overlapping windows, reshuffled each epoch with a (seed, epoch)-keyed
-        permutation: every token is seen once per epoch (uniform repeat counts),
-        unlike independent uniform draws which leave ~exp(-epochs) of the corpus
-        unseen. Same determinism contract: order is a pure function of
-        (manifest, seed, seq_len, k), so audit replay is unchanged.
-        """
-        n_win = self._total // (self.seq_len + 1)
-        epoch, idx = divmod(k, n_win)
-        if getattr(self, "_perm_epoch", None) != epoch:
-            prng = np.random.default_rng(np.array([self.seed, 0xE90C4, epoch], dtype=np.uint64))
-            self._perm = prng.permutation(n_win)
-            self._perm_epoch = epoch
-        return int(self._perm[idx]) * (self.seq_len + 1)
+    def _epoch_perm(self, epoch: int) -> np.ndarray:
+        """MEMOIZED deterministic permutation of the `n_blocks` contiguous blocks
+        for the given epoch. Keyed by (seed, 0xE9C, epoch) so it is bit-identical
+        across runs (validator re-derivation) and never rebuilt once cached."""
+        perm = self._perm_cache.get(epoch)
+        if perm is None:
+            rng = np.random.default_rng(
+                np.array([self.seed, 0xE9C, epoch], dtype=np.uint64)
+            )
+            perm = rng.permutation(self._n_blocks)
+            self._perm_cache[epoch] = perm
+        return perm
 
     def get_batch(
         self,
         step: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return a batch of (B, T) input + target tensors at the given step."""
-        starts = [self._perm_window_start(step * batch_size + b) for b in range(batch_size)]
+        """Return a batch of (B, T) input + target tensors at the given step.
+
+        No-replacement permuted sweep: for row `b` the global block index is
+        gi = step*batch_size + b, decomposed into epoch = gi // n_blocks and
+        pos = gi % n_blocks; the sampled block is memoized_perm(epoch)[pos] and
+        the window starts at block*(seq_len+1). Deterministic in (seed, step, b)
+        and bit-reproducible; per-epoch perms are memoized so tok/s is unaffected.
+        """
+        n_blocks = self._n_blocks
+        stride = self.seq_len + 1
         inputs = np.empty((batch_size, self.seq_len), dtype=np.int64)
         targets = np.empty((batch_size, self.seq_len), dtype=np.int64)
-        for b, s in enumerate(starts):
-            chunk = self._read_range(int(s), self.seq_len + 1).astype(np.int64)
+        for b in range(batch_size):
+            gi = step * batch_size + b
+            epoch = gi // n_blocks
+            pos = gi % n_blocks
+            block = int(self._epoch_perm(epoch)[pos])
+            start = block * stride
+            chunk = self._read_range(start, stride).astype(np.int64)
             inputs[b] = chunk[:-1]
             targets[b] = chunk[1:]
         return torch.from_numpy(inputs), torch.from_numpy(targets)

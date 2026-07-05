@@ -121,11 +121,11 @@ def set_determinism(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.use_deterministic_algorithms(False)
     except Exception:
         pass
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 def schedule_frac(step: int, cfg: TrainConfig) -> float:
@@ -260,8 +260,10 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if "tok_embed" in n or "lm_head" in n:
-                embed_params.append(p)
+            if "tok_embed" in n or "lm_head" in n or "value_embed" in n:
+                embed_params.append(p)  # recipe-v5: VE table trains with AdamW like the token embedding
+            elif "ve_lambda" in n:
+                norm_params.append(p)   # recipe-v5: VE mixing scalars — AdamW, no weight decay
             elif p.dim() >= 2:
                 muon_params.append(p)
             else:
@@ -445,7 +447,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
                 f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}",
                 flush=True,
             )
-        if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
+        if (step % 500 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
             torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
